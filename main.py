@@ -1,23 +1,21 @@
 import os
-import asyncio
-import httpx
+import requests
 import pyarrow.parquet as pq
 import io
-from datetime import datetime, timedelta
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import HTTPException as FastAPIHTTPException
 from starlette.responses import JSONResponse
+from datetime import datetime, timedelta
 
 # ── CONFIG ──────────────────────────────────────────────
 API_KEY = os.environ.get("API_KEY", "psychoxd")
 DEVELOPER = "@psychopathmc"
-SUPPORT_MSG = "For API purchase, contact @psychopathmc"  # 🔥 Support message
+SUPPORT_MSG = "For API purchase, contact @psychopathmc"
 BASE_URL = "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main"
-CACHE_TTL = 300
-SESSION_TIMEOUT = 10
+CACHE_TTL = 300  # 5 minutes
 
-app = FastAPI(title="PsychopathMC OSINT API", version="9.0")
+app = FastAPI(title="PsychopathMC OSINT API", version="10.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,11 +31,11 @@ async def custom_http_exception_handler(request: Request, exc: FastAPIHTTPExcept
         content={
             "error": exc.detail,
             "developer": DEVELOPER,
-            "support": SUPPORT_MSG,  # 🔥 Support added in error too
+            "support": SUPPORT_MSG,
         }
     )
 
-# ── Helper: Circle / Operator Lookup ────────────────────
+# ── Helper: Circle Lookup ──────────────────────────────
 def get_circle(num: str) -> str:
     prefixes = {
         "9810": "AIRTEL DELHI", "9871": "AIRTEL DELHI", "9818": "AIRTEL DELHI",
@@ -47,59 +45,44 @@ def get_circle(num: str) -> str:
     pref = num[:4]
     return prefixes.get(pref, "UNKNOWN CIRCLE")
 
-# ── Async HTTP Client ──────────────────────────────────
-_client = None
-
-async def get_client():
-    global _client
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(SESSION_TIMEOUT),
-            limits=httpx.Limits(max_keepalive_connections=5),
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-    return _client
-
-# ── Cache ────────────────────────────────────────────────
+# ── Simple Cache ─────────────────────────────────────────
 _cache = {}
-_cache_timestamps = {}
+_cache_time = {}
 
-async def get_cache(url: str, column: str, value: str):
+def get_cache(url, column, value):
     key = f"{url}|{column}|{value}"
-    if key in _cache and (datetime.now() - _cache_timestamps[key]).seconds < CACHE_TTL:
+    if key in _cache and (datetime.now() - _cache_time[key]).seconds < CACHE_TTL:
         return _cache[key]
     return None
 
-async def set_cache(url: str, column: str, value: str, data):
+def set_cache(url, column, value, data):
     key = f"{url}|{column}|{value}"
     _cache[key] = data
-    _cache_timestamps[key] = datetime.now()
+    _cache_time[key] = datetime.now()
     if len(_cache) > 100:
-        oldest = min(_cache_timestamps, key=_cache_timestamps.get)
+        oldest = min(_cache_time, key=_cache_time.get)
         del _cache[oldest]
-        del _cache_timestamps[oldest]
+        del _cache_time[oldest]
 
-# ── Fetch Logic ──────────────────────────────────────────
-async def fetch_data(url: str, column: str, value: str, limit: int = 15):
-    cached = await get_cache(url, column, value)
+# ── Fetch Logic (Synchronous) ───────────────────────────
+def fetch_data(url: str, column: str, value: str, limit: int = 15):
+    cached = get_cache(url, column, value)
     if cached is not None:
         return cached
 
     try:
-        client = await get_client()
-        resp = await client.get(url)
+        resp = requests.get(url, timeout=10)
         if resp.status_code != 200:
             return []
-        
+        # Read only needed columns for speed
         needed_cols = ["name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber", "address"]
         table = pq.read_table(io.BytesIO(resp.content), columns=needed_cols)
         df = table.to_pandas()
-        
         if column not in df.columns:
             return []
         filtered = df[df[column] == value]
         results = filtered.head(limit).to_dict(orient="records")
-        await set_cache(url, column, value, results)
+        set_cache(url, column, value, results)
         return results
     except Exception as e:
         print(f"Fetch error: {e}")
@@ -111,11 +94,11 @@ def root():
     return {
         "message": "PsychoAPI is live. Use /psychoapi?Number=XXX&key=psychoxd",
         "developer": DEVELOPER,
-        "support": SUPPORT_MSG,  # 🔥 Support added
+        "support": SUPPORT_MSG,
     }
 
 @app.get("/psychoapi")
-async def psychoapi(
+def psychoapi(
     Number: str = Query(..., description="Phone number"),
     key: str = Query(..., description="API Key"),
     limit: int = Query(15, ge=1, le=50)
@@ -134,14 +117,14 @@ async def psychoapi(
 
     # 4. Search Phone Index
     phone_url = f"{BASE_URL}/idx_phone.{shard}.parquet"
-    results = await fetch_data(phone_url, "phoneNumber", Number, limit)
+    results = fetch_data(phone_url, "phoneNumber", Number, limit)
 
-    # 5. If no result, search Aadhar Index (fallback)
+    # 5. If no result, search Aadhar Index
     if not results:
         aadhar_url = f"{BASE_URL}/idx_aadhar.{shard}.parquet"
-        results = await fetch_data(aadhar_url, "aadharNumber", Number, limit)
+        results = fetch_data(aadhar_url, "aadharNumber", Number, limit)
 
-    # 6. Deduplicate results (remove exact duplicates based on aadhar)
+    # 6. Deduplicate by aadhar
     seen = set()
     unique_results = []
     for row in results:
@@ -165,7 +148,7 @@ async def psychoapi(
             "alt": row.get("otherNumber"),
         })
 
-    # 8. Final Response Wrapper
+    # 8. Final Response
     return {
         "response": {
             "parameters": {
@@ -176,5 +159,5 @@ async def psychoapi(
             "data": formatted
         },
         "developer": DEVELOPER,
-        "support": SUPPORT_MSG,  # 🔥 Support added here too
+        "support": SUPPORT_MSG,
     }
