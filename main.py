@@ -9,7 +9,7 @@ from starlette.responses import JSONResponse
 API_KEY = os.environ.get("API_KEY", "psychoxd")
 DEVELOPER = "@psychopathmc"
 SUPPORT = "Discord: psychopathmc"
-BASE_URL = "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main"
+BASE_URL = ""
 
 app = FastAPI(title="PsychopathMC OSINT API", version="3.0")
 
